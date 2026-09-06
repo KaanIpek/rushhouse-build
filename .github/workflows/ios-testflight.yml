@@ -1,0 +1,406 @@
+# Rushhouse -> TestFlight, from a Windows machine with no Mac.
+#
+# NO UNITY RUNS HERE. Unity 6 Personal cannot be activated in CI any more: the licence lives in
+# Unity's new licensing client, which does not produce a Unity_lic.ulf, and Unity has discontinued
+# manual activation for Personal licences ("Unity no longer supports manual activation of Personal
+# licenses" — license.unity3d.com/manual). GameCI needs one of UNITY_SERIAL or UNITY_LICENSE and
+# Personal can supply neither, so the whole CI-runs-Unity design is dead for this account.
+#
+# The split that does work, and is better anyway:
+#
+#   Unity -> Xcode project      on the DEV MACHINE, where the licence is already active
+#   archive + sign + upload     here, on macos-latest, which is the only place xcodebuild exists
+#
+# That also removes licence activation — historically the most fragile step in this pipeline —
+# from CI entirely, and drops the secret count from 7 to 4.
+#
+# ---- HOW TO RUN ------------------------------------------------------------------------------
+# 1. On the dev machine:
+#      Unity -batchmode -quit -buildTarget iOS -projectPath . \
+#            -executeMethod RushhouseSceneBuilder.BuildIOSProject -buildNumber <N> -logFile -
+#      tar -czf xcode-project.tar.gz -C Builds iOS        # ~256 MB
+#    NOTE the `-buildTarget iOS`: without it the editor keeps Windows as its active target and
+#    the iOS post-processors are skipped, silently producing a project with no AdMob app id and
+#    no encryption declaration.
+# 2. Draft a GitHub Release (any tag, e.g. `xcode-1`) and attach xcode-project.tar.gz to it.
+# 3. Run this workflow with that tag.
+#
+# ---- SECRETS (4, all already exist for this account's other game) ----------------------------
+#   ASC_KEY_ID       App Store Connect API key id
+#   ASC_ISSUER_ID    App Store Connect issuer id
+#   ASC_KEY_P8_B64   base64 of the .p8 key. IT MUST HAVE THE **ADMIN** ROLE — App Manager can read
+#                    /v1/certificates but cannot CREATE the distribution certificate, and that
+#                    only fails several minutes into -exportArchive.
+#   APPLE_TEAM_ID    10-character team id
+#
+# Public repositories get free unmetered GitHub-hosted runners, macOS included, so this costs
+# nothing. Nothing in this file is a secret, and every run log here is world-readable -- which is
+# why no step ever echoes a secret and the payload arrives encrypted.
+#
+# THIS REPOSITORY HOLDS NO GAME SOURCE. KaanIpek/rushhouse is private and never runs a macOS job;
+# this repo is public purely so the runners are free. On a private repo one ~20-minute macOS archive
+# bills ~200 of the 2000 free monthly minutes, because macOS carries a 10x multiplier.
+#
+#   PAYLOAD_KEY      the passphrase Tools/push_ios_payload.sh encrypted the tarball with. Must be
+#                    BYTE-IDENTICAL to %USERPROFILE%/.rushhouse/ci.env on the dev machine.
+
+name: ios-testflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_branch:
+        description: 'Branch holding ci-payload/xcode.part* (leave blank to use a Release asset)'
+        required: false
+        default: 'xcode-payload'
+      xcode_release_tag:
+        description: 'Release tag holding xcode-project.tar.gz (used only when payload_branch is blank)'
+        required: false
+        default: 'xcode-1'
+      release_notes:
+        description: 'What testers see in TestFlight'
+        required: false
+        default: 'Rushhouse build'
+
+jobs:
+  archive:
+    name: Archive, sign, upload to TestFlight
+    runs-on: macos-latest
+    permissions:
+      contents: read          # gh release download needs this and nothing more
+    steps:
+      # NO actions/checkout. Nothing in this job reads a file from the repository — the Xcode project
+      # arrives from a Release asset and everything else happens under $RUNNER_TEMP. Cloning a
+      # 328 MB Unity repo to use none of it cost 4m14s of run 4. `gh release download` authenticates
+      # with github.token and needs no working copy.
+      # TWO WAYS IN. A Release asset is the tidy one, but attaching a 256 MB file to a Release can
+      # only be done by a human dragging it into the browser: the upload tool available here caps at
+      # 10 MB, and GitHub's CSP (connect-src is a strict allowlist) forbids the release page from
+      # fetching those bytes from a local server instead. So the payload can be committed to a
+      # throwaway branch in chunks small enough to push, and reassembled here. Same bytes either way
+      # -- the md5 recorded beside the parts IS checked, because a truncated chunk would otherwise
+      # surface much later as an incomprehensible tar or compiler error.
+      # BOTH WAYS IN CARRY CIPHERTEXT. This repository is public, and the tarball is the compiled
+      # game -- there is no plaintext path into it, because a Release asset here is exactly as public
+      # as a branch here.
+      - name: Fetch the encrypted payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          ENC="$RUNNER_TEMP/xcode-project.tar.gz.enc"
+          if [ -n "${{ inputs.payload_branch }}" ]; then
+            git clone --depth 1 --branch "${{ inputs.payload_branch }}" --single-branch \
+              "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "$RUNNER_TEMP/payload"
+            ls -l "$RUNNER_TEMP/payload/ci-payload"
+            cat "$RUNNER_TEMP/payload"/ci-payload/xcode.part* > "$ENC"
+            # The md5 is of the CIPHERTEXT and is checked BEFORE any key is involved, so a truncated
+            # chunk is reported as a truncated chunk rather than as "bad decrypt".
+            want=$(cat "$RUNNER_TEMP/payload/ci-payload/xcode.md5")
+            got=$(md5 -q "$ENC")
+            echo "ciphertext md5 want=$want got=$got"
+            [ "$want" = "$got" ] || { echo "::error::reassembled payload md5 mismatch - a chunk is truncated or missing"; exit 1; }
+          else
+            gh release download "${{ inputs.xcode_release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" --pattern 'xcode-project.tar.gz.enc' --dir "$RUNNER_TEMP"
+          fi
+          ls -lh "$ENC"
+
+      # THE PAYLOAD IS ENCRYPTED BECAUSE THIS REPOSITORY IS PUBLIC. The key exists in exactly two
+      # places: %USERPROFILE%/.rushhouse/ci.env on the dev machine, and the PAYLOAD_KEY secret here.
+      #
+      # openssl is chosen at runtime rather than assumed. macOS ships LibreSSL as /usr/bin/openssl
+      # and the runners also carry a real OpenSSL 3 from Homebrew; the two have differed over the
+      # years in what `enc -pbkdf2` accepts and defaults to, and a KDF mismatch does not fail
+      # loudly -- it decrypts to garbage that only explodes later, inside tar.
+      - name: Decrypt and unpack
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+        run: |
+          set -e
+          if [ -z "$PAYLOAD_KEY" ]; then
+            echo "::error::the PAYLOAD_KEY secret is not set on this repository. Tools/push_ios_payload.sh encrypted the payload; without the same passphrase this job cannot read its own input."
+            exit 1
+          fi
+          OPENSSL=""
+          for cand in /opt/homebrew/opt/openssl@3/bin/openssl \
+                      /usr/local/opt/openssl@3/bin/openssl \
+                      /usr/bin/openssl; do
+            [ -x "$cand" ] || continue
+            if "$cand" enc -help 2>&1 | grep -q -- '-pbkdf2'; then OPENSSL="$cand"; break; fi
+          done
+          [ -n "$OPENSSL" ] || { echo "::error::no openssl on this runner supports -pbkdf2"; exit 1; }
+          echo "using $OPENSSL -> $("$OPENSSL" version)"
+
+          "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 \
+            -in "$RUNNER_TEMP/xcode-project.tar.gz.enc" \
+            -out "$RUNNER_TEMP/xcode-project.tar.gz" \
+            -pass env:PAYLOAD_KEY \
+            || { echo "::error::decryption failed. The PAYLOAD_KEY secret here differs from the one in %USERPROFILE%/.rushhouse/ci.env on the dev machine - a trailing newline or a Windows CR is enough to make it a different key."; exit 1; }
+          ls -lh "$RUNNER_TEMP/xcode-project.tar.gz"
+          rm -f "$RUNNER_TEMP/xcode-project.tar.gz.enc"
+
+          mkdir -p "$RUNNER_TEMP/ios"
+          tar -xzf "$RUNNER_TEMP/xcode-project.tar.gz" -C "$RUNNER_TEMP/ios"
+          ls "$RUNNER_TEMP/ios/iOS" | head
+
+      # tar was used rather than actions/upload-artifact precisely because artifacts DO NOT
+      # PRESERVE THE EXECUTABLE BIT: Unity's output contains MapFileParser.sh and
+      # process_symbols.sh, which then fail deep in a build phase with a bare "Permission denied"
+      # that names no file. Re-assert it here in case the archive was ever rebuilt by other means.
+      - name: Make Unity's helper scripts executable
+        run: |
+          find "$RUNNER_TEMP/ios/iOS" -name '*.sh' -exec chmod +x {} \;
+          ls -l "$RUNNER_TEMP/ios/iOS/MapFileParser.sh" 2>/dev/null || true
+
+      # RushhouseIOSPostProcess writes CFBundleIconName from Unity, but a Release tarball generated
+      # BEFORE that fix has a source plist without it, and regenerating one costs a 256 MB upload to
+      # change a single key. So assert it here too. This is idempotent and a no-op on tarballs that
+      # already carry the key, which is why it is unconditional rather than tag-dependent — a step
+      # that only runs for old tags is a step nobody remembers is there.
+      - name: Ensure CFBundleIconName in the source Info.plist
+        run: |
+          PLIST="$RUNNER_TEMP/ios/iOS/Info.plist"
+          if /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$PLIST" >/dev/null 2>&1; then
+            echo "already present: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$PLIST")"
+          else
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "$PLIST"
+            echo "added CFBundleIconName = AppIcon"
+          fi
+
+      # The runner ships several Xcodes and its default is not always the newest. Apple has
+      # required the iOS 26 SDK since 2026-04-28 and CHECKS IT AT UPLOAD — archive and export both
+      # succeed, then App Store Connect returns a 409 about the SDK. Print the SDK so the log
+      # answers "what was this built with" without anyone guessing.
+      - name: Select the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          NEWEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "selecting $NEWEST"
+          sudo xcode-select -s "$NEWEST/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      # `secrets` is NOT a valid context inside `if:` — writing `if: secrets.X != ''` does not
+      # evaluate false, it makes the YAML invalid and the run reports zero jobs with no error.
+      - name: Do we have signing secrets?
+        id: keys
+        env:
+          P8: ${{ secrets.ASC_KEY_P8_B64 }}
+        run: |
+          if [ -n "$P8" ]; then echo "signed=true" >> "$GITHUB_OUTPUT"
+          else echo "signed=false" >> "$GITHUB_OUTPUT"; fi
+
+      # Google Mobile Ads is a CocoaPod. Unity emits the Podfile (verified locally: it declares
+      # Google-Mobile-Ads-SDK ~> 13.6, GoogleUserMessagingPlatform 3.1.0 and, crucially,
+      # `use_frameworks! :linkage => :static` — those Google SDKs ship static binaries and
+      # CocoaPods refuses to mix them with dynamic frameworks). Everything after this must build
+      # the WORKSPACE: building Unity-iPhone.xcodeproj links without the pods and fails with
+      # missing GAD symbols, mentioning neither CocoaPods nor AdMob.
+      - name: pod install
+        working-directory: ${{ runner.temp }}/ios/iOS
+        run: |
+          test -f Podfile || { echo "::error::no Podfile — the Unity build did not run EDM4U"; exit 1; }
+          cat Podfile
+          # --repo-update clones the whole legacy spec repo and cost 12 of the first run's 19
+          # minutes. These pods resolve through the CDN trunk source, which needs no local repo at
+          # all, so try the fast path first and only pay for the slow one if resolution actually
+          # fails — which is the single case --repo-update exists to fix.
+          pod install || {
+            echo "plain pod install failed; retrying with --repo-update"
+            pod install --repo-update
+          }
+          ls -d Unity-iPhone.xcworkspace
+
+      - name: Stage the App Store Connect key
+        if: steps.keys.outputs.signed == 'true'
+        run: |
+          mkdir -p ~/private_keys
+          echo "${{ secrets.ASC_KEY_P8_B64 }}" | base64 --decode > ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+          chmod 600 ~/private_keys/*.p8
+
+      # Unity emits a SHARED scheme (verified locally: Unity-iPhone.xcodeproj/xcshareddata/
+      # xcschemes/Unity-iPhone.xcscheme exists), so -scheme resolves. Listed anyway because a
+      # missing scheme fails with text that offers nothing to act on.
+      - name: List schemes
+        working-directory: ${{ runner.temp }}/ios/iOS
+        run: xcodebuild -list -workspace Unity-iPhone.xcworkspace
+
+      # ARCHIVE UNSIGNED, SIGN AT EXPORT, THEN FIX THE FRAMEWORKS EXPORT DOES NOT TOUCH.
+      #
+      # Archiving WITH signing was tried in run 3 and cannot work for this account:
+      #
+      #   Communication with Apple failed: Your team has no devices from which to generate a
+      #   provisioning profile.
+      #   No profiles for 'com.rldgames.rushhouse' were found: Xcode couldn't find any iOS App
+      #   Development provisioning profiles matching 'com.rldgames.rushhouse'.
+      #
+      # That is Apple's intended flow showing its edge: `archive` with automatic signing builds with
+      # a DEVELOPMENT identity, and development profiles are generated from registered devices. With
+      # no Mac and no device there is nothing to register, so the archive can only be unsigned and
+      # all real signing has to happen afterwards. -allowProvisioningUpdates does not help here —
+      # it is only ever asked for a distribution profile at EXPORT, which needs no devices.
+      - name: Archive (unsigned)
+        working-directory: ${{ runner.temp }}/ios/iOS
+        run: |
+          xcodebuild \
+            -workspace Unity-iPhone.xcworkspace \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Rushhouse.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            archive
+
+      # Every upload-stage rejection is visible in the archive in two seconds. ITMS errors
+      # otherwise arrive by EMAIL ten minutes later, somewhere nobody is watching.
+      #
+      # CFBundleIconName is written by RushhouseIOSPostProcess rather than left to actool. Run 1
+      # archived successfully and still produced a plist without it, so the key is now declared in
+      # the source plist; see that file for why the asset catalog was ruled out as the cause.
+      # Because a declared key could otherwise hide actool never having run at all, the presence of
+      # the COMPILED catalog (Assets.car) is asserted separately — key and icons are two different
+      # failures and the log should say which one happened.
+      - name: Check the built Info.plist
+        run: |
+          APP=$(ls -d "$RUNNER_TEMP"/Rushhouse.xcarchive/Products/Applications/*.app | head -1)
+          PLIST="$APP/Info.plist"
+          echo "reading $PLIST"
+          for key in CFBundleIdentifier CFBundleVersion CFBundleShortVersionString \
+                     CFBundleIconName GADApplicationIdentifier ITSAppUsesNonExemptEncryption \
+                     MinimumOSVersion DTSDKName; do
+            printf '%-34s ' "$key"
+            /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" 2>/dev/null || echo "(MISSING)"
+          done
+          echo "--- CFBundleIcons (if any) ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIcons" "$PLIST" 2>/dev/null || echo "(absent)"
+          echo "--- icon payload in the bundle ---"
+          ls -l "$APP"/Assets.car 2>/dev/null || echo "Assets.car ABSENT"
+          ls "$APP" | grep -i "AppIcon" || echo "(no loose AppIcon*.png — normal, they live in Assets.car)"
+
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$PLIST" >/dev/null 2>&1 \
+            || { echo "::error::CFBundleIconName missing — the app icon did not reach the build"; exit 1; }
+          # An icon set named by the plist but never compiled is rejected just as hard, and looks
+          # identical from the plist alone.
+          test -f "$APP/Assets.car" \
+            || { echo "::error::Assets.car absent — actool did not compile Images.xcassets, so the icon the plist names does not exist in the bundle"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print :GADApplicationIdentifier" "$PLIST" >/dev/null 2>&1 \
+            || { echo "::error::GADApplicationIdentifier missing — the app will crash on launch"; exit 1; }
+
+      # THE 90035 FIX. exportArchive re-signs nested code that already carries a signature and skips
+      # code that arrived bare — it re-signs with --preserve-metadata, which needs an existing
+      # signature to preserve. Everything Xcode compiles is signed before it is embedded, so the
+      # only casualty is a vendored binary framework the build merely COPIES: unity-plugin-library,
+      # shipped prebuilt inside the Google Mobile Ads Unity plugin. With the archive unsigned it
+      # reaches the .ipa bare, and Apple rejects the upload with 90035.
+      #
+      # Doing this AFTER export was tried in run 4 and cannot work: `security find-identity` reports
+      # "0 valid identities found" even though export had just produced a correctly signed app.
+      # -allowProvisioningUpdates signs through a temporary keychain that it tears down again, so
+      # there is no identity left to re-sign anything with once export has finished.
+      #
+      # Ad-hoc signing needs no identity, no certificate and no provisioning profile. It is not the
+      # final signature and is not meant to be — it exists so that a signature is THERE for export
+      # to replace with the real distribution one a step later.
+      - name: Ad-hoc sign any bare framework so export will re-sign it
+        working-directory: ${{ runner.temp }}
+        run: |
+          APP=$(ls -d Rushhouse.xcarchive/Products/Applications/*.app | head -1)
+          echo "app: $APP"
+          for fw in "$APP"/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            name=$(basename "$fw")
+            if codesign -v "$fw" >/dev/null 2>&1; then
+              printf '%-52s already signed\n' "$name"
+            else
+              printf '%-52s bare -> ad-hoc signing\n' "$name"
+              codesign --force --sign - "$fw"
+            fi
+          done
+          # The app bundle's own signature seals its nested code, so it has to be (re)done last.
+          # It is unsigned here too, the archive having been built with signing off.
+          codesign --force --sign - "$APP" 2>/dev/null || true
+          echo "--- state going into export ---"
+          for fw in "$APP"/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            printf '%-52s ' "$(basename "$fw")"
+            codesign -v "$fw" >/dev/null 2>&1 && echo signed || echo STILL-BARE
+          done
+
+      - name: Export a signed .ipa
+        if: steps.keys.outputs.signed == 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          # method must be app-store-connect on Xcode 15.3+. NEVER set testFlightInternalTestingOnly:
+          # such a build is permanently barred from external TestFlight and the App Store, with no
+          # promote-later path. teamID is required or a multi-team account fails to resolve.
+          cat > ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>${{ secrets.APPLE_TEAM_ID }}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>destination</key><string>export</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Rushhouse.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8 \
+            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
+            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }}
+          ls -l "$RUNNER_TEMP/export"
+
+      # Apple rejected an .ipa that xcodebuild had just reported exporting successfully, because one
+      # nested framework was unsigned. That answer cost a full archive plus a minute of uploading,
+      # and arrived as a 90035 from a server rather than from the tool that built the thing. The
+      # same verdict is available locally in seconds: --deep walks every nested bundle, and
+      # --strict refuses to pass a signature it merely tolerates.
+      - name: Verify every nested signature before uploading
+        if: steps.keys.outputs.signed == 'true'
+        run: |
+          cd "$RUNNER_TEMP" && rm -rf sigcheck && mkdir sigcheck
+          unzip -q export/*.ipa -d sigcheck
+          APP=$(ls -d sigcheck/Payload/*.app | head -1)
+          echo "--- embedded frameworks ---"
+          ls "$APP/Frameworks" 2>/dev/null || echo "(none)"
+          # Report every framework individually: "the app is signed" is exactly the claim that was
+          # true last run and still failed, so name the file if one of them is bare.
+          fail=0
+          for fw in "$APP"/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            printf '%-52s ' "$(basename "$fw")"
+            codesign -v --strict "$fw" 2>&1 && echo "OK" || { echo "UNSIGNED/INVALID"; fail=1; }
+          done
+          echo "--- whole app, deep ---"
+          codesign -vvv --deep --strict "$APP" 2>&1 || fail=1
+          echo "--- signing identity actually used ---"
+          codesign -dvv "$APP" 2>&1 | grep -iE "Authority|TeamIdentifier" || true
+          [ "$fail" = "0" ] \
+            || { echo "::error::A nested bundle is unsigned or invalidly signed — Apple rejects this with 90035, see the per-framework list above"; exit 1; }
+
+      - name: Upload to TestFlight
+        if: steps.keys.outputs.signed == 'true'
+        run: |
+          # altool's NOTARIZATION was removed in 2023 — that is what "altool is deprecated" refers
+          # to. --upload-app for App Store submissions still works.
+          xcrun altool --upload-app -f "$RUNNER_TEMP"/export/*.ipa -t ios \
+            --apiKey "${{ secrets.ASC_KEY_ID }}" \
+            --apiIssuer "${{ secrets.ASC_ISSUER_ID }}"
+          echo "Uploaded. Processing takes a few minutes."
+          echo "REMINDER: a build assigned to NO tester group is valid and completely invisible —"
+          echo "testers keep being offered the previous build, with no error anywhere."
+
+      - name: Keep the archive when signing is not configured
+        if: steps.keys.outputs.signed != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-xcarchive
+          path: ${{ runner.temp }}/Rushhouse.xcarchive
+          retention-days: 3
